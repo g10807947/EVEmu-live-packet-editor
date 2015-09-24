@@ -1,7 +1,9 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 namespace Marshal
 {
@@ -26,12 +28,72 @@ namespace Marshal
 
         private int _currentSaveIndex;
 
+        [DllImport("advapi32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        public static extern bool CryptAcquireContext(ref IntPtr hProv, string pszContainer, string pszProvider, uint dwProvType, uint dwFlags);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        public static extern bool CryptImportKey(IntPtr hProv, byte[] pbData, uint dwDataLen, IntPtr hPubKey, uint dwFlags, ref IntPtr phKey);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        public static extern bool CryptDestroyKey(IntPtr phKey);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        public static extern bool CryptDecrypt(IntPtr hKey, IntPtr hHash, bool final, uint dwFlags, byte[] pbData, ref uint pdwDataLen);
+
+        private static DateTime KeyFileModifiedDate;
+        private static IntPtr hProv, hKey;
+        private static object CryptoLock = new object();
+
+        public bool IsEvePacket(ref byte[] data)
+        {
+            if (data[0] == ZlibMarker)
+                data = Zlib.Decompress(data);
+            return data[0] == HeaderByte;
+        }
+
         public PyObject Process(byte[] data)
         {
             if (data == null)
                 return null;
-            if (data[0] == ZlibMarker)
-                data = Zlib.Decompress(data);
+
+            lock (CryptoLock)
+            {
+                while (!IsEvePacket(ref data))
+                {
+                    if (hKey != IntPtr.Zero)
+                    {
+                        var declength = (uint)data.Length;
+                        if (!CryptDecrypt(hKey, IntPtr.Zero, true, 0, data, ref declength))
+                            throw new Win32Exception(@"CryptDecrypt");
+                        if (data.Length != declength)
+                            Array.Resize(ref data, (int)declength);
+
+                        if (IsEvePacket(ref data))
+                            break;
+
+                        if (!CryptDestroyKey(hKey))
+                            throw new Win32Exception(@"CryptDestroyKey");
+                        hKey = IntPtr.Zero;
+                    }
+                    else
+                    {
+                        var fi = new FileInfo(@"C:\Users\User\Desktop\eve.key");
+                        if (KeyFileModifiedDate < fi.LastWriteTime)
+                        {
+                            KeyFileModifiedDate = fi.LastWriteTime;
+
+                            if (hProv == IntPtr.Zero && !CryptAcquireContext(ref hProv, null, @"Microsoft Enhanced Cryptographic Provider v1.0", 1, 0xf0000040))
+                                throw new Win32Exception(@"CryptAcquireContext");
+
+                            byte[] key;
+                            using (var f = fi.Open(FileMode.Open))
+                                key = f.ReadAllBytes();
+                            if (hKey == IntPtr.Zero && !CryptImportKey(hProv, key, (uint)key.Length, IntPtr.Zero, 0, ref hKey))
+                                throw new Win32Exception(@"CryptImportKey");
+                        }
+                        else
+                            Thread.Yield();
+                    }
+                }
+            }
+
             return Process(new BinaryReader(new MemoryStream(data), Encoding.ASCII));
         }
 
